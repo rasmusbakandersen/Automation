@@ -1,0 +1,474 @@
+---
+# Fedora Server Hardening Playbook - Common
+# Applies to all servers in the [fedora] inventory group
+# Run: ansible-playbook -i inventory.ini fedora-hardening-common.yml
+#
+# What this playbook does:
+#   1.  Audits firewall (report only, no changes)
+#   2.  Enforces SELinux + shared booleans + policy modules
+#   3.  Hardens Docker daemon configuration
+#   4.  Disables unnecessary services
+#   5.  Applies kernel hardening via sysctl
+#   6.  Audits user accounts (report only, no changes)
+#   7.  SSH key-only authentication (COMMENTED OUT - enable when ready)
+#   8.  Sets up automatic security updates (dnf-automatic)
+#   9.  Ensures auditd is running
+#   10. Sets timezone
+#   11. Audits Tailscale status
+#   12. Sets HISTTIMEFORMAT for bash history
+
+- name: Fedora Server Hardening - Common
+  hosts: fedora
+  become: true
+  vars:
+    timezone: "Europe/Copenhagen"
+    ssh_user: "rasmus"
+    docker_user: "rasmus"
+
+  tasks:
+    # =========================================================================
+    # 1. FIREWALL AUDIT (report only)
+    # =========================================================================
+    - name: "[FIREWALL] Get active zones"
+      ansible.builtin.command: firewall-cmd --get-active-zones
+      register: fw_zones
+      changed_when: false
+
+    - name: "[FIREWALL] Get current firewall rules"
+      ansible.builtin.command: firewall-cmd --list-all
+      register: fw_rules
+      changed_when: false
+
+    - name: "[FIREWALL] Display firewall configuration"
+      ansible.builtin.debug:
+        msg: |
+          === Active Zones ===
+          {{ fw_zones.stdout }}
+
+          === Current Rules ===
+          {{ fw_rules.stdout }}
+
+    - name: "[FIREWALL] Get all listening ports"
+      ansible.builtin.shell: ss -tlnp | grep -v docker-proxy
+      register: listening_ports
+      changed_when: false
+
+    - name: "[FIREWALL] Display listening ports (excluding Docker)"
+      ansible.builtin.debug:
+        msg: "{{ listening_ports.stdout }}"
+
+    # =========================================================================
+    # 2. SELINUX ENFORCEMENT + SHARED BOOLEANS
+    # =========================================================================
+    - name: "[SELINUX] Install required SELinux tools"
+      ansible.builtin.dnf:
+        name:
+          - policycoreutils-python-utils
+          - selinux-policy-targeted
+          - setroubleshoot-server
+        state: present
+
+    - name: "[SELINUX] Set SELinux to enforcing in config"
+      ansible.builtin.lineinfile:
+        path: /etc/selinux/config
+        regexp: '^SELINUX='
+        line: 'SELINUX=enforcing'
+        backup: true
+
+    - name: "[SELINUX] Check current SELinux mode"
+      ansible.builtin.command: getenforce
+      register: selinux_mode
+      changed_when: false
+
+    - name: "[SELINUX] Enable enforcing mode at runtime"
+      ansible.builtin.command: setenforce 1
+      when: selinux_mode.stdout != "Enforcing"
+      changed_when: true
+
+    - name: "[SELINUX] Enable container_connect_any boolean"
+      ansible.posix.seboolean:
+        name: container_connect_any
+        state: true
+        persistent: true
+
+    - name: "[SELINUX] Create nm-dispatcher policy source"
+      ansible.builtin.copy:
+        dest: /tmp/nm_dispatcher.te
+        content: |
+          module nm_dispatcher 1.0;
+          require {
+                  type NetworkManager_dispatcher_t;
+                  class capability sys_resource;
+          }
+          allow NetworkManager_dispatcher_t self:capability sys_resource;
+        mode: '0644'
+
+    - name: "[SELINUX] Check if nm-dispatcher module is already installed"
+      ansible.builtin.shell: semodule -l | grep -q nm_dispatcher
+      register: nm_module_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[SELINUX] Compile nm-dispatcher policy"
+      ansible.builtin.command: checkmodule -M -m -o /tmp/nm_dispatcher.mod /tmp/nm_dispatcher.te
+      when: nm_module_check.rc != 0
+
+    - name: "[SELINUX] Package nm-dispatcher policy"
+      ansible.builtin.command: semodule_package -o /tmp/nm_dispatcher.pp -m /tmp/nm_dispatcher.mod
+      when: nm_module_check.rc != 0
+
+    - name: "[SELINUX] Install nm-dispatcher policy"
+      ansible.builtin.command: semodule -i /tmp/nm_dispatcher.pp
+      when: nm_module_check.rc != 0
+
+    - name: "[SELINUX] Clean up nm-dispatcher temp files"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/nm_dispatcher.te
+        - /tmp/nm_dispatcher.mod
+        - /tmp/nm_dispatcher.pp
+
+    # =========================================================================
+    # 3. DOCKER HARDENING
+    # =========================================================================
+    # NOTE: daemon.json is NOT managed by this playbook because servers
+    # have different configs (e.g. HomeLab1 has custom address pools).
+    # Manually merge these settings into each server's /etc/docker/daemon.json:
+    #   "live-restore": true,
+    #   "no-new-privileges": false,
+    #   "log-driver": "json-file",
+    #   "log-opts": { "max-size": "10m", "max-file": "3" },
+    #   "default-ulimits": { "nofile": { "Name": "nofile", "Hard": 65536, "Soft": 65536 } }
+
+    - name: "[DOCKER] Check if Docker is installed"
+      ansible.builtin.command: which docker
+      register: docker_installed
+      changed_when: false
+      failed_when: false
+
+    - name: "[DOCKER] Add user to docker group"
+      ansible.builtin.user:
+        name: "{{ docker_user }}"
+        groups: docker
+        append: true
+      when: docker_installed.rc == 0
+
+    - name: "[DOCKER] Ensure Docker service is enabled and running"
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+      when: docker_installed.rc == 0
+
+    # =========================================================================
+    # 4. DISABLE UNNECESSARY SERVICES
+    # =========================================================================
+    - name: "[SERVICES] Check which unnecessary services exist"
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+      register: service_status
+      loop:
+        - ModemManager
+        - abrtd
+        - abrt-dump-journal
+        - rpcbind
+        - rpcbind.socket
+      failed_when: false
+      changed_when: false
+
+    - name: "[SERVICES] Disable and stop unnecessary services"
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop:
+        - ModemManager
+        - abrtd
+        - abrt-dump-journal
+        - rpcbind
+        - rpcbind.socket
+      failed_when: false
+
+    # =========================================================================
+    # 5. KERNEL HARDENING
+    # =========================================================================
+    - name: "[KERNEL] Apply sysctl hardening settings"
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-security.conf
+        content: |
+          # Prevent IP spoofing
+          net.ipv4.conf.all.rp_filter = 1
+          net.ipv4.conf.default.rp_filter = 1
+
+          # Ignore ICMP redirects
+          net.ipv4.conf.all.accept_redirects = 0
+          net.ipv4.conf.default.accept_redirects = 0
+          net.ipv6.conf.all.accept_redirects = 0
+
+          # Don't send ICMP redirects
+          net.ipv4.conf.all.send_redirects = 0
+          net.ipv4.conf.default.send_redirects = 0
+
+          # Ignore broadcast pings
+          net.ipv4.icmp_echo_ignore_broadcasts = 1
+
+          # Log suspicious packets
+          net.ipv4.conf.all.log_martians = 1
+
+          # Enable SYN flood protection
+          net.ipv4.tcp_syncookies = 1
+
+          # Restrict kernel pointer exposure
+          kernel.kptr_restrict = 2
+
+          # Restrict dmesg access
+          kernel.dmesg_restrict = 1
+        mode: '0644'
+        backup: true
+      notify: Apply sysctl
+
+    # =========================================================================
+    # 6. USER ACCOUNT AUDIT (report only)
+    # =========================================================================
+    - name: "[AUDIT] Check for accounts with empty passwords"
+      ansible.builtin.shell: "awk -F: '$2==\"\" {print $1}' /etc/shadow"
+      register: empty_passwords
+      changed_when: false
+
+    - name: "[AUDIT] WARNING - Accounts with empty passwords found"
+      ansible.builtin.debug:
+        msg: "WARNING: The following accounts have empty passwords: {{ empty_passwords.stdout }}"
+      when: empty_passwords.stdout | length > 0
+
+    - name: "[AUDIT] OK - No accounts with empty passwords"
+      ansible.builtin.debug:
+        msg: "OK: No accounts with empty passwords found"
+      when: empty_passwords.stdout | length == 0
+
+    - name: "[AUDIT] Check for non-root UID 0 accounts"
+      ansible.builtin.shell: "awk -F: '$3==0 && $1!=\"root\" {print $1}' /etc/passwd"
+      register: uid_zero
+      changed_when: false
+
+    - name: "[AUDIT] WARNING - Non-root UID 0 accounts found"
+      ansible.builtin.debug:
+        msg: "WARNING: The following non-root accounts have UID 0: {{ uid_zero.stdout }}"
+      when: uid_zero.stdout | length > 0
+
+    - name: "[AUDIT] OK - No non-root UID 0 accounts"
+      ansible.builtin.debug:
+        msg: "OK: Only root has UID 0"
+      when: uid_zero.stdout | length == 0
+
+    - name: "[AUDIT] Check wheel group members"
+      ansible.builtin.command: getent group wheel
+      register: wheel_members
+      changed_when: false
+
+    - name: "[AUDIT] Display wheel group members"
+      ansible.builtin.debug:
+        msg: "Wheel (sudo) group members: {{ wheel_members.stdout }}"
+
+    # =========================================================================
+    # 7. SSH KEY-ONLY AUTHENTICATION (COMMENTED OUT)
+    # Uncomment when you have verified SSH keys work from multiple devices.
+    # After enabling, update inventory.ini to use ansible_user=rasmus
+    # instead of ansible_user=root, since root login will be disabled.
+    # Fallbacks if locked out: Proxmox VM console, Webmin via Tailscale.
+    # =========================================================================
+    # - name: "[SSH] Disable password authentication"
+    #   ansible.builtin.lineinfile:
+    #     path: /etc/ssh/sshd_config
+    #     regexp: '^#?PasswordAuthentication'
+    #     line: 'PasswordAuthentication no'
+    #     backup: true
+    #   notify: Restart SSH
+
+    # - name: "[SSH] Disable root login"
+    #   ansible.builtin.lineinfile:
+    #     path: /etc/ssh/sshd_config
+    #     regexp: '^#?PermitRootLogin'
+    #     line: 'PermitRootLogin no'
+    #     backup: true
+    #   notify: Restart SSH
+
+    # - name: "[SSH] Set max auth tries"
+    #   ansible.builtin.lineinfile:
+    #     path: /etc/ssh/sshd_config
+    #     regexp: '^#?MaxAuthTries'
+    #     line: 'MaxAuthTries 3'
+    #     backup: true
+    #   notify: Restart SSH
+
+    # - name: "[SSH] Disable empty passwords"
+    #   ansible.builtin.lineinfile:
+    #     path: /etc/ssh/sshd_config
+    #     regexp: '^#?PermitEmptyPasswords'
+    #     line: 'PermitEmptyPasswords no'
+    #     backup: true
+    #   notify: Restart SSH
+
+    # - name: "[SSH] Disable X11 forwarding"
+    #   ansible.builtin.lineinfile:
+    #     path: /etc/ssh/sshd_config
+    #     regexp: '^#?X11Forwarding'
+    #     line: 'X11Forwarding no'
+    #     backup: true
+    #   notify: Restart SSH
+
+    # =========================================================================
+    # 8. AUTOMATIC SECURITY UPDATES
+    # =========================================================================
+    - name: "[UPDATES] Install dnf-automatic"
+      ansible.builtin.dnf:
+        name: dnf-automatic
+        state: present
+
+    - name: "[UPDATES] Copy default config if available"
+      ansible.builtin.copy:
+        src: /usr/share/dnf5/dnf5-plugins/automatic.conf
+        dest: /etc/dnf/automatic.conf
+        remote_src: true
+        force: false
+        mode: '0644'
+      failed_when: false
+
+    - name: "[UPDATES] Set upgrade_type to security"
+      ansible.builtin.lineinfile:
+        path: /etc/dnf/automatic.conf
+        regexp: '^upgrade_type\s*='
+        line: 'upgrade_type = security'
+        create: true
+        mode: '0644'
+
+    - name: "[UPDATES] Enable apply_updates"
+      ansible.builtin.lineinfile:
+        path: /etc/dnf/automatic.conf
+        regexp: '^apply_updates\s*='
+        line: 'apply_updates = yes'
+        create: true
+        mode: '0644'
+
+    - name: "[UPDATES] Enable dnf-automatic timer"
+      ansible.builtin.systemd:
+        name: dnf-automatic-install.timer
+        state: started
+        enabled: true
+      failed_when: false
+
+    - name: "[UPDATES] Try dnf5-automatic timer if dnf4 timer not found"
+      ansible.builtin.systemd:
+        name: dnf5-automatic.timer
+        state: started
+        enabled: true
+      failed_when: false
+
+    # =========================================================================
+    # 9. ENSURE AUDITD IS RUNNING
+    # =========================================================================
+    - name: "[AUDITD] Ensure auditd is installed"
+      ansible.builtin.dnf:
+        name: audit
+        state: present
+
+    - name: "[AUDITD] Ensure auditd is enabled and running"
+      ansible.builtin.systemd:
+        name: auditd
+        state: started
+        enabled: true
+
+    # =========================================================================
+    # 10. SET TIMEZONE
+    # =========================================================================
+    - name: "[TIMEZONE] Set system timezone"
+      community.general.timezone:
+        name: "{{ timezone }}"
+
+    # =========================================================================
+    # 11. TAILSCALE AUDIT
+    # =========================================================================
+    - name: "[TAILSCALE] Check if Tailscale is installed"
+      ansible.builtin.command: which tailscale
+      register: tailscale_installed
+      changed_when: false
+      failed_when: false
+
+    - name: "[TAILSCALE] Check Tailscale status"
+      ansible.builtin.command: tailscale status
+      register: tailscale_status
+      changed_when: false
+      failed_when: false
+      when: tailscale_installed.rc == 0
+
+    - name: "[TAILSCALE] Display Tailscale status"
+      ansible.builtin.debug:
+        msg: "{{ tailscale_status.stdout }}"
+      when: tailscale_installed.rc == 0
+
+    - name: "[TAILSCALE] WARNING - Tailscale not installed"
+      ansible.builtin.debug:
+        msg: "WARNING: Tailscale is not installed on this server"
+      when: tailscale_installed.rc != 0
+
+    # =========================================================================
+    # 12. BASH HISTORY TIMESTAMPS
+    # =========================================================================
+    - name: "[HISTORY] Set HISTTIMEFORMAT globally"
+      ansible.builtin.copy:
+        dest: /etc/profile.d/history-timestamps.sh
+        content: |
+          # Add timestamps to bash history
+          export HISTTIMEFORMAT="%Y-%m-%d %H:%M:%S  "
+          export HISTSIZE=10000
+          export HISTFILESIZE=20000
+        mode: '0644'
+
+    # =========================================================================
+    # SUMMARY
+    # =========================================================================
+    - name: "[SUMMARY] Check SELinux status"
+      ansible.builtin.command: getenforce
+      register: final_selinux
+      changed_when: false
+
+    - name: "[SUMMARY] Display hardening summary"
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          HARDENING COMPLETE - {{ inventory_hostname }}
+          ============================================
+          SELinux:              {{ final_selinux.stdout }}
+          Timezone:             {{ timezone }}
+          SSH Password Auth:    NOT CHANGED (commented out)
+          Kernel Hardening:     Applied
+          Auto Security Updates: Enabled
+          Auditd:               Running
+          History Timestamps:   Enabled
+          ============================================
+          MANUAL STEPS REMAINING:
+          - Set up SSH keys on multiple devices
+          - Uncomment SSH section when keys are verified
+          - Update inventory.ini to ansible_user=rasmus
+          - Review firewall audit output above
+          - Review user account audit output above
+          ============================================
+
+  # ===========================================================================
+  # HANDLERS
+  # ===========================================================================
+  handlers:
+    - name: Restart Docker
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+
+    - name: Apply sysctl
+      ansible.builtin.command: sysctl --system
+      changed_when: true
+
+    - name: Restart SSH
+      ansible.builtin.systemd:
+        name: sshd
+        state: restarted

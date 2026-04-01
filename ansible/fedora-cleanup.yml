@@ -1,0 +1,192 @@
+---
+# Fedora Server Disk Cleanup Playbook
+# Applies to all servers in the [fedora] inventory group
+# Run: ansible-playbook -i inventory.ini fedora-cleanup.yml
+# Dry run: ansible-playbook -i inventory.ini fedora-cleanup.yml -e "dry_run=true"
+
+- name: Fedora Server Disk Cleanup
+  hosts: fedora
+  become: true
+  vars:
+    keep_kernels: 2
+    journal_size_max: "500M"
+    journal_time_max: "7d"
+    dry_run: false
+
+  tasks:
+    # =========================================================================
+    # 1. DISK USAGE ANALYSIS
+    # =========================================================================
+    - name: "[DISK] Show top-level disk usage"
+      shell: du -sh /* 2>/dev/null | sort -hr | head -10
+      register: disk_usage
+      changed_when: false
+
+    - name: "[DISK] Display disk usage"
+      debug:
+        var: disk_usage.stdout_lines
+
+    - name: "[DISK] Show initial disk space"
+      shell: df -h / | tail -1 | awk '{print "Total:", $2, "Used:", $3, "Available:", $4, "Use%:", $5}'
+      register: initial_disk
+      changed_when: false
+
+    - name: "[DISK] Display initial disk space"
+      debug:
+        msg: "BEFORE cleanup - {{ inventory_hostname }}: {{ initial_disk.stdout }}"
+
+    # =========================================================================
+    # 2. CLEAN DNF CACHE
+    # =========================================================================
+    - name: "[DNF] Clean DNF cache"
+      dnf:
+        cacheonly: yes
+        state: absent
+      when: not dry_run
+
+    - name: "[DNF] Show DNF cache size"
+      shell: du -sh /var/cache/dnf | cut -f1
+      register: dnf_size_after
+      changed_when: false
+
+    - name: "[DNF] Display DNF cache size"
+      debug:
+        msg: "DNF cache size: {{ dnf_size_after.stdout }}"
+
+    # =========================================================================
+    # 3. REMOVE OLD KERNELS
+    # =========================================================================
+    - name: "[KERNELS] Get old kernels to remove"
+      shell: dnf repoquery --installonly --latest-limit=-{{ keep_kernels }} -q
+      register: old_kernels
+      changed_when: false
+      failed_when: false
+
+    - name: "[KERNELS] Display old kernels found"
+      debug:
+        msg: "Old kernels to remove: {{ old_kernels.stdout_lines | default(['none']) }}"
+
+    - name: "[KERNELS] DNF autoremove"
+      dnf:
+        autoremove: yes
+      when: not dry_run
+
+    # =========================================================================
+    # 4. JOURNAL LOGS
+    # =========================================================================
+    - name: "[JOURNAL] Show journal disk usage before"
+      shell: journalctl --disk-usage
+      register: journal_usage_before
+      changed_when: false
+
+    - name: "[JOURNAL] Display journal usage before"
+      debug:
+        var: journal_usage_before.stdout_lines
+
+    - name: "[JOURNAL] Vacuum journal logs"
+      shell: journalctl --vacuum-size={{ journal_size_max }} --vacuum-time={{ journal_time_max }}
+      when: not dry_run
+
+    - name: "[JOURNAL] Show journal disk usage after"
+      shell: journalctl --disk-usage
+      register: journal_usage_after
+      changed_when: false
+      when: not dry_run
+
+    - name: "[JOURNAL] Display journal usage after"
+      debug:
+        var: journal_usage_after.stdout_lines
+      when: not dry_run
+
+    # =========================================================================
+    # 5. DOCKER CLEANUP
+    # =========================================================================
+    - name: "[DOCKER] Check Docker availability"
+      shell: which docker
+      register: docker_check
+      failed_when: false
+      changed_when: false
+
+    - name: "[DOCKER] Show Docker usage"
+      shell: docker system df
+      register: docker_df
+      when: docker_check.rc == 0
+      changed_when: false
+
+    - name: "[DOCKER] Display Docker usage"
+      debug:
+        var: docker_df.stdout_lines
+      when: docker_check.rc == 0
+
+    - name: "[DOCKER] System prune (unused only, keep volumes)"
+      shell: docker system prune -af
+      when:
+        - docker_check.rc == 0
+        - not dry_run
+
+    - name: "[DOCKER] Remove unused Docker networks"
+      shell: docker network prune -f
+      when:
+        - docker_check.rc == 0
+        - not dry_run
+
+    # =========================================================================
+    # 6. CLEAN OLD LOG FILES
+    # =========================================================================
+    - name: "[LOGS] Find rotated log files older than 30 days"
+      shell: find /var/log -type f \( -name "*.gz" -o -name "*.old" \) -mtime +30 2>/dev/null | head -20
+      register: old_logs
+      changed_when: false
+
+    - name: "[LOGS] Display old log files found"
+      debug:
+        msg: "{{ old_logs.stdout_lines | default(['none found']) }}"
+
+    - name: "[LOGS] Remove rotated log files older than 30 days"
+      shell: find /var/log -type f \( -name "*.gz" -o -name "*.old" \) -mtime +30 -delete 2>/dev/null; echo "done"
+      when: not dry_run
+      changed_when: false
+
+    # =========================================================================
+    # 7. CLEAN TEMP FILES
+    # =========================================================================
+    - name: "[TEMP] Clean /tmp files older than 7 days"
+      shell: find /tmp -type f -mtime +7 -not -path "/tmp/crowdsec*" -delete 2>/dev/null; echo "done"
+      when: not dry_run
+      changed_when: false
+
+    - name: "[TEMP] Clean /var/tmp files older than 30 days"
+      shell: find /var/tmp -type f -mtime +30 -delete 2>/dev/null; echo "done"
+      when: not dry_run
+      changed_when: false
+
+    # =========================================================================
+    # 8. SELINUX HEALTH CHECK
+    # =========================================================================
+    - name: "[SELINUX] Count SELinux denials today"
+      shell: ausearch -m avc -ts today 2>/dev/null | grep -c "type=AVC" || echo "0"
+      register: selinux_denials
+      changed_when: false
+
+    - name: "[SELINUX] Display SELinux denial count"
+      debug:
+        msg: "SELinux denials today: {{ selinux_denials.stdout }}"
+
+    # =========================================================================
+    # 9. FINAL SUMMARY
+    # =========================================================================
+    - name: "[SUMMARY] Get final disk space"
+      shell: df -h / | tail -1 | awk '{print "Total:", $2, "Used:", $3, "Available:", $4, "Use%:", $5}'
+      register: final_disk
+      changed_when: false
+
+    - name: "[SUMMARY] Display cleanup summary"
+      debug:
+        msg: |
+          ============================================
+          CLEANUP COMPLETE - {{ inventory_hostname }}
+          ============================================
+          BEFORE: {{ initial_disk.stdout }}
+          AFTER:  {{ final_disk.stdout }}
+          SELinux denials today: {{ selinux_denials.stdout }}
+          ============================================

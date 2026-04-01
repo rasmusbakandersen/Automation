@@ -1,0 +1,124 @@
+---
+# check_crowdsec_failures.yml
+# Pulls CrowdSec decisions and recent alerts from Docker container
+# on HomeLab3 (sole Docker/CrowdSec host). Outputs JSON for n8n parsing.
+#
+# Usage:
+#   ansible-playbook -i /home/rasmus/automation/ansible/inventory.ini check_crowdsec_failures.yml
+
+- name: Check CrowdSec decisions and alerts
+  hosts: docker-hosts
+  gather_facts: false
+  become: true
+
+  vars:
+    crowdsec_container: crowdsec
+
+  tasks:
+    # ── 1. Verify CrowdSec container is running ──────────────────────
+    - name: Check if CrowdSec container is running
+      ansible.builtin.shell: |
+        docker inspect --format '{{ '{{' }}.State.Running{{ '}}' }}' {{ crowdsec_container }} 2>/dev/null || echo "false"
+      register: cs_running
+      changed_when: false
+      failed_when: false
+
+    - name: Skip host if CrowdSec is not running
+      ansible.builtin.debug:
+        msg: "CSJSON{{ '{' }}\"host\":\"{{ inventory_hostname }}\",\"status\":\"container_not_running\",\"active_decisions\":0,\"recent_alerts\":0,\"decisions\":[],\"alert_summary\":\"\"{{ '}' }}"
+      when: cs_running.stdout | trim != "true"
+
+    # ── 2. Pull active decisions (current bans/captchas) ─────────────
+    - name: Get active CrowdSec decisions
+      ansible.builtin.shell: |
+        docker exec {{ crowdsec_container }} cscli decisions list -o json 2>/dev/null || echo "[]"
+      register: cs_decisions_raw
+      changed_when: false
+      failed_when: false
+      when: cs_running.stdout | trim == "true"
+
+    # ── 3. Pull alerts from the last hour ─────────────────────────────
+    - name: Get recent CrowdSec alerts (last hour)
+      ansible.builtin.shell: |
+        docker exec {{ crowdsec_container }} cscli alerts list --since 1h -o json 2>/dev/null || echo "[]"
+      register: cs_alerts_raw
+      changed_when: false
+      failed_when: false
+      when: cs_running.stdout | trim == "true"
+
+    # ── 4. Summarize decisions ────────────────────────────────────────
+    - name: Parse and summarize CrowdSec data
+      ansible.builtin.shell: |
+        python3 << 'PYEOF'
+        import json
+        import sys
+
+        host = "{{ inventory_hostname }}"
+
+        # Parse decisions
+        try:
+            decisions_raw = '''{{ cs_decisions_raw.stdout | default("[]") }}'''
+            decisions = json.loads(decisions_raw) if decisions_raw.strip() else []
+            if decisions is None:
+                decisions = []
+        except (json.JSONDecodeError, ValueError):
+            decisions = []
+
+        # Parse alerts
+        try:
+            alerts_raw = '''{{ cs_alerts_raw.stdout | default("[]") }}'''
+            alerts = json.loads(alerts_raw) if alerts_raw.strip() else []
+            if alerts is None:
+                alerts = []
+        except (json.JSONDecodeError, ValueError):
+            alerts = []
+
+        # Summarize active decisions
+        decision_summary = []
+        for d in decisions[:20]:  # cap at 20
+            entry = {
+                "ip": d.get("value", "unknown"),
+                "reason": d.get("scenario", "unknown"),
+                "type": d.get("type", "ban"),
+                "duration": d.get("duration", "unknown"),
+            }
+            decision_summary.append(entry)
+
+        # Summarize recent alerts
+        alert_scenarios = {}
+        alert_ips = set()
+        for a in alerts:
+            scenario = a.get("scenario", "unknown")
+            alert_scenarios[scenario] = alert_scenarios.get(scenario, 0) + 1
+            # Extract source IP from alert
+            source = a.get("source", {})
+            if isinstance(source, dict) and source.get("value"):
+                alert_ips.add(source["value"])
+
+        alert_text_parts = []
+        for scenario, count in sorted(alert_scenarios.items(), key=lambda x: -x[1]):
+            alert_text_parts.append(f"{scenario}: {count}")
+        alert_summary = " | ".join(alert_text_parts) if alert_text_parts else "none"
+
+        result = {
+            "host": host,
+            "status": "ok",
+            "active_decisions": len(decisions),
+            "recent_alerts": len(alerts),
+            "decisions": decision_summary[:10],  # top 10 for notification
+            "alert_summary": alert_summary,
+            "unique_alert_ips": len(alert_ips),
+        }
+
+        print("CSJSON" + json.dumps(result, separators=(',', ':')))
+        PYEOF
+      register: cs_summary
+      changed_when: false
+      failed_when: false
+      when: cs_running.stdout | trim == "true"
+
+    # ── 5. Output the summary line ────────────────────────────────────
+    - name: Output CrowdSec JSON summary
+      ansible.builtin.debug:
+        msg: "{{ cs_summary.stdout }}"
+      when: cs_running.stdout | trim == "true" and cs_summary.stdout is defined

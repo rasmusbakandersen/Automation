@@ -1,0 +1,9 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+# SSH keys
+ansible/ssh/homelab
+# n8n backup logs
+scripts/n8n-git-backup.log

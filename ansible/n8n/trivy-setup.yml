@@ -1,0 +1,80 @@
+---
+# playbooks/trivy-setup.yml
+# Installs Trivy, deploys the scan script, configures sudoers and DB cron
+# Run: ansible-playbook playbooks/trivy-setup.yml
+
+- name: Setup Trivy container scanning
+  hosts: docker-hosts
+  become: true
+  vars:
+    trivy_scan_user: rasmus
+    trivy_severity: "HIGH,CRITICAL"
+    trivy_db_update_hour: "3"
+    trivy_db_update_weekday: "6"  # Saturday
+
+  tasks:
+    - name: Import Trivy GPG key
+      ansible.builtin.rpm_key:
+        key: https://aquasecurity.github.io/trivy-repo/rpm/public.key
+        state: present
+
+    - name: Add Trivy repository
+      ansible.builtin.yum_repository:
+        name: trivy
+        description: Trivy repository
+        baseurl: https://aquasecurity.github.io/trivy-repo/rpm/releases/$basearch/
+        gpgcheck: true
+        gpgkey: https://aquasecurity.github.io/trivy-repo/rpm/public.key
+        enabled: true
+
+    - name: Install Trivy
+      ansible.builtin.dnf:
+        name: trivy
+        state: present
+
+    - name: Deploy Trivy scan script
+      ansible.builtin.copy:
+        src: trivy-scan-containers.sh
+        dest: /usr/local/bin/trivy-scan-containers.sh
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Allow passwordless sudo for scan script
+      ansible.builtin.copy:
+        content: |
+          {{ trivy_scan_user }} ALL=(root) NOPASSWD: /usr/local/bin/trivy-scan-containers.sh
+        dest: /etc/sudoers.d/trivy-scan
+        owner: root
+        group: root
+        mode: "0440"
+        validate: "visudo -cf %s"
+
+    - name: Download Trivy vulnerability database
+      ansible.builtin.command:
+        cmd: trivy image --download-db-only
+      changed_when: true
+      register: trivy_db_download
+      timeout: 300
+
+    - name: Schedule weekly Trivy DB update (Saturday night)
+      ansible.builtin.cron:
+        name: "trivy-db-update"
+        user: root
+        hour: "{{ trivy_db_update_hour }}"
+        minute: "0"
+        weekday: "{{ trivy_db_update_weekday }}"
+        job: "/usr/bin/trivy image --download-db-only 2>/dev/null"
+
+    - name: Verify scan script works
+      ansible.builtin.command:
+        cmd: /usr/local/bin/trivy-scan-containers.sh
+      become_user: root
+      register: trivy_test
+      changed_when: false
+      timeout: 600
+
+    - name: Show scan test result
+      ansible.builtin.debug:
+        msg: "Trivy scan returned {{ trivy_test.stdout | from_json | json_query('totalImages') }} images, {{ trivy_test.stdout | from_json | json_query('totalCritical') }} critical, {{ trivy_test.stdout | from_json | json_query('totalHigh') }} high"
+      when: trivy_test.rc == 0

@@ -1,0 +1,38 @@
+---
+- name: Docker Error Log Scan (Last 1 Hour)
+  hosts: docker-hosts
+  gather_facts: false
+
+  vars:
+    log_since: "1h"
+    error_patterns: "error|fatal|panic|critical|exception|traceback|fail|denied|refused|timeout|killed|oom|segfault|crash"
+    exclude_patterns: "error_reporting|error_log|on_error|error_page|error_handler|errorlevel|errno|_errors|loglevel|error\\.css|error\\.js"
+
+  tasks:
+    - name: Get running container IDs and names
+      ansible.builtin.shell: docker ps --format '{{ '{{' }}.ID{{ '}}' }} {{ '{{' }}.Names{{ '}}' }} {{ '{{' }}.Image{{ '}}' }}'
+      register: containers
+      changed_when: false
+
+    - name: Scan each container for errors
+      ansible.builtin.shell: |
+        ERRORS=$(docker logs --since {{ log_since }} {{ item.split()[0] }} 2>&1 \
+          | grep -iE '{{ error_patterns }}' \
+          | grep -ivE '{{ exclude_patterns }}' \
+          | tail -30)
+        if [ -n "$ERRORS" ]; then
+          echo "$ERRORS"
+        fi
+      register: log_results
+      loop: "{{ containers.stdout_lines }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Display results
+      ansible.builtin.debug:
+        msg: |
+          === {{ item.item.split()[1] }} ({{ item.item.split()[2] }}) ===
+          {{ item.stdout if item.stdout else 'No errors found' }}
+      loop: "{{ log_results.results }}"
+      loop_control:
+        label: "{{ item.item.split()[1] }}"

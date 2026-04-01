@@ -1,0 +1,54 @@
+---
+- name: Update Fedora servers
+  hosts: fedora
+  become: true
+  tasks:
+    - name: Update all packages
+      dnf:
+        name: '*'
+        state: latest
+      register: dnf_result
+
+    - name: Display updated packages
+      debug:
+        msg: "{{ dnf_result.results | default(['No updates available']) }}"
+
+    - name: Check if reboot is needed
+      shell: needs-restarting -r
+      register: reboot_needed
+      changed_when: false
+      failed_when: false
+
+    - name: Display reboot status
+      debug:
+        msg: "{{ 'REBOOT REQUIRED' if reboot_needed.rc != 0 else 'No reboot needed' }}"
+
+- name: Update Proxmox servers
+  hosts: proxmox
+  become: true
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Full dist-upgrade
+      apt:
+        upgrade: dist
+      register: apt_result
+
+    - name: Autoremove unused packages
+      apt:
+        autoremove: yes
+
+    - name: Display update results
+      debug:
+        msg: "{{ apt_result.stdout_lines | default(['No updates available']) }}"
+
+    - name: Check if reboot is needed
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_file
+
+    - name: Display reboot status
+      debug:
+        msg: "{{ 'REBOOT REQUIRED' if reboot_file.stat.exists else 'No reboot needed' }}"

@@ -1,0 +1,56 @@
+---
+# check_ssh_failures.yml
+# Checks failed SSH login attempts in the last hour across all hosts.
+# Targets: homelab1, homelab3, homelab5, homelab7, proxmox1, proxmox2, proxmox3
+# Outputs JSON summary lines (tagged SSHJSON) for n8n parsing.
+#
+# Usage:
+#   ansible-playbook -i /home/rasmus/automation/ansible/inventory.ini check_ssh_failures.yml
+
+- name: Check for failed SSH attempts
+  hosts: all
+  gather_facts: false
+  become: true
+
+  tasks:
+    # ── 1. Grab failed-auth lines from the last hour ──────────────────
+    # Uses -t sshd / sshd-session to catch both service names
+    # (newer Fedora logs under sshd-session; Proxmox/Debian uses sshd)
+    - name: Query journalctl for failed SSH attempts (last hour)
+      ansible.builtin.shell: |
+        journalctl -t sshd -t sshd-session \
+          --since "1 hour ago" \
+          --no-pager \
+          -q \
+          --output=short-iso 2>/dev/null \
+        | grep -iE 'failed password|invalid user|authentication failure|refused connect|bad protocol|unable to negotiate' \
+        || true
+      register: ssh_failures
+      changed_when: false
+      failed_when: false
+
+    # ── 2. Extract unique attacking IPs ───────────────────────────────
+    - name: Extract unique source IPs from failures
+      ansible.builtin.shell: |
+        echo "{{ ssh_failures.stdout }}" \
+        | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
+        | sort | uniq -c | sort -rn \
+        | head -20 \
+        || true
+      register: attacker_ips
+      changed_when: false
+      failed_when: false
+      when: ssh_failures.stdout | length > 0
+
+    # ── 3. Build facts ────────────────────────────────────────────────
+    - name: Set failure facts
+      ansible.builtin.set_fact:
+        failure_count: "{{ ssh_failures.stdout_lines | length }}"
+        failure_sample: "{{ ssh_failures.stdout_lines[-3:] | default([]) | join(' /// ') }}"
+        top_ips: "{{ attacker_ips.stdout | default('none') }}"
+
+    # ── 4. Emit JSON (the only line n8n parses) ──────────────────────
+    - name: Output JSON summary
+      ansible.builtin.debug:
+        msg: >-
+          SSHJSON{{ '{' }}"host":"{{ inventory_hostname }}","ip":"{{ ansible_host }}","group":"{{ group_names | first }}","failure_count":{{ failure_count }},"top_ips":"{{ top_ips | regex_replace('\n', ' | ') | regex_replace('"', '') }}","sample":"{{ failure_sample | regex_replace('"', "'") }}"{{ '}' }}

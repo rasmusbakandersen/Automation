@@ -1,0 +1,64 @@
+---
+- name: Deploy NUT client to all hosts
+  hosts: all
+  become: true
+  vars:
+    nut_server: "192.168.86.5"
+    nut_ups_name: "masterpower"
+    nut_password: "REDACTED"
+    nut_user: "upsslave"
+    nut_conf_dir: "{{ '/etc/ups' if ansible_os_family == 'RedHat' else '/etc/nut' }}"
+    nut_group: "{{ 'nut' if ansible_os_family == 'Debian' else 'root' }}"
+
+  tasks:
+    # --- Package installation ---
+    - name: Install NUT client (Fedora)
+      ansible.builtin.dnf:
+        name: nut-client
+        state: present
+      when: ansible_os_family == "RedHat"
+
+    - name: Install NUT client (Debian/Proxmox)
+      ansible.builtin.apt:
+        name: nut-client
+        state: present
+        update_cache: true
+      when: ansible_os_family == "Debian"
+
+    # --- Configuration ---
+    - name: Ensure NUT config directory exists
+      ansible.builtin.file:
+        path: "{{ nut_conf_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Configure NUT mode
+      ansible.builtin.copy:
+        content: "MODE=netclient\n"
+        dest: "{{ nut_conf_dir }}/nut.conf"
+        owner: root
+        group: "{{ nut_group }}"
+        mode: "0640"
+      notify: Restart nut-monitor
+
+    - name: Configure upsmon
+      ansible.builtin.template:
+        src: templates/upsmon.conf.j2
+        dest: "{{ nut_conf_dir }}/upsmon.conf"
+        owner: root
+        group: "{{ nut_group }}"
+        mode: "0640"
+      notify: Restart nut-monitor
+
+    # --- Service ---
+    - name: Enable and start nut-monitor
+      ansible.builtin.systemd:
+        name: nut-monitor
+        enabled: true
+        state: started
+
+  handlers:
+    - name: Restart nut-monitor
+      ansible.builtin.systemd:
+        name: nut-monitor
+        state: restarted

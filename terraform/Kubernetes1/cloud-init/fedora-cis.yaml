@@ -1,0 +1,430 @@
+#cloud-config
+# ============================================================================
+# Fedora Cloud-Init — CIS-Aligned Baseline Hardening
+# ============================================================================
+#
+# This cloud-init config runs ONCE on first boot and applies:
+#   - User account creation with SSH key
+#   - Package installation (guest agent, security tools)
+#   - CIS Level 1 kernel and filesystem hardening
+#   - Network stack hardening (sysctl)
+#   - SSH server hardening (password auth left ENABLED for now)
+#   - Audit framework basics
+#   - Firewalld enabled with default deny
+#
+# IMPORTANT: This is provisioning-level hardening only. Further
+# configuration (disabling password SSH, CrowdSec, Wazuh agent, etc.)
+# is handled by Ansible post-provisioning.
+#
+# Variables like ${hostname} are replaced by Terraform's templatefile().
+# ============================================================================
+
+
+# ---------------------------------------------------------------------------
+# Hostname
+# ---------------------------------------------------------------------------
+hostname: ${hostname}
+manage_etc_hosts: true
+# Sets /etc/hostname and updates /etc/hosts so the VM knows its own name.
+
+
+# ---------------------------------------------------------------------------
+# User Account
+# ---------------------------------------------------------------------------
+# CIS 5.4.1 recommends strong user/group management.
+# We create a single admin user with sudo and SSH key access.
+# The default "fedora" user from the cloud image is removed.
+# ---------------------------------------------------------------------------
+users:
+  - name: ${ci_user}
+    groups: wheel           # wheel = sudo group on Fedora/RHEL
+    sudo: ALL=(ALL) NOPASSWD:ALL  # Passwordless sudo (lock down later with Ansible)
+    shell: /bin/bash
+    lock_passwd: false      # Allow password login (will be hardened by Ansible)
+    ssh_authorized_keys:
+      - ${ssh_key}
+
+# Remove the default "fedora" cloud user if it exists
+runcmd_early:
+  - userdel -r fedora 2>/dev/null || true
+
+
+# ---------------------------------------------------------------------------
+# Timezone & Locale
+# ---------------------------------------------------------------------------
+timezone: ${timezone}
+
+
+# ---------------------------------------------------------------------------
+# Package Installation
+# ---------------------------------------------------------------------------
+# Install essential packages before applying hardening.
+# qemu-guest-agent: communicates with Proxmox for graceful shutdown & IP reporting
+# audit/aide:       CIS requirement for system auditing and file integrity
+# firewalld:        CIS requirement for host-based firewall
+# chrony:           CIS requirement for time synchronisation (NTP)
+# ---------------------------------------------------------------------------
+package_update: true
+package_upgrade: true
+
+packages:
+  - qemu-guest-agent
+  - audit
+  - audit-libs
+  - aide
+  - firewalld
+  - chrony
+  - policycoreutils-python-utils  # SELinux management tools
+  - tmux
+  - curl
+  - vim-enhanced
+
+
+# ---------------------------------------------------------------------------
+# CIS Hardening: Filesystem & Kernel Modules
+# ---------------------------------------------------------------------------
+# CIS 1.1.1.x — Disable mounting of uncommon filesystem types.
+# These are rarely needed on servers and reduce the attack surface.
+# We blacklist them via modprobe so the kernel can't load them.
+# ---------------------------------------------------------------------------
+write_files:
+
+  # --- CIS 1.1.1: Disable unused filesystems ---
+  - path: /etc/modprobe.d/cis-filesystems.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      # CIS 1.1.1.1 — Disable cramfs (compressed ROM filesystem)
+      install cramfs /bin/true
+      blacklist cramfs
+
+      # CIS 1.1.1.2 — Disable freevxfs (Veritas filesystem)
+      install freevxfs /bin/true
+      blacklist freevxfs
+
+      # CIS 1.1.1.3 — Disable jffs2 (flash filesystem)
+      install jffs2 /bin/true
+      blacklist jffs2
+
+      # CIS 1.1.1.4 — Disable hfs (macOS Classic filesystem)
+      install hfs /bin/true
+      blacklist hfs
+
+      # CIS 1.1.1.5 — Disable hfsplus (macOS Extended filesystem)
+      install hfsplus /bin/true
+      blacklist hfsplus
+
+      # CIS 1.1.1.6 — Disable squashfs (compressed read-only filesystem)
+      # NOTE: Remove this line if you use snap packages
+      install squashfs /bin/true
+      blacklist squashfs
+
+      # CIS 1.1.1.7 — Disable udf (Universal Disk Format, used by DVDs)
+      install udf /bin/true
+      blacklist udf
+
+  # --- CIS 1.1.1.8 — Disable USB storage (optional, uncommon on servers) ---
+  - path: /etc/modprobe.d/cis-usb-storage.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      install usb-storage /bin/true
+      blacklist usb-storage
+
+
+  # -------------------------------------------------------------------------
+  # CIS 1.5.1 — Restrict core dumps
+  # -------------------------------------------------------------------------
+  # Core dumps can contain sensitive data (passwords, keys in memory).
+  # Disabling them prevents accidental information disclosure.
+  # -------------------------------------------------------------------------
+  - path: /etc/security/limits.d/cis-core-dumps.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      # CIS 1.5.1 — Disable core dumps for all users
+      *    hard    core    0
+
+  - path: /etc/sysctl.d/50-cis-coredump.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      # CIS 1.5.1 — Disable SUID core dumps
+      fs.suid_dumpable = 0
+
+
+  # -------------------------------------------------------------------------
+  # CIS 3.x — Network Stack Hardening (sysctl)
+  # -------------------------------------------------------------------------
+  # These kernel parameters harden the TCP/IP stack against common attacks:
+  # spoofing, redirect-based MITM, SYN floods, and information leaks.
+  # -------------------------------------------------------------------------
+  - path: /etc/sysctl.d/60-cis-network.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      # --- CIS 3.1.1 — Disable IP forwarding ---
+      # Servers should not route packets between interfaces.
+      # Enable ONLY if this VM is a router/firewall.
+      net.ipv4.ip_forward = 0
+      net.ipv6.conf.all.forwarding = 0
+
+      # --- CIS 3.2.1 — Disable source-routed packets ---
+      # Source routing lets senders specify the route. Attackers abuse this
+      # to bypass firewalls. No legitimate use on modern networks.
+      net.ipv4.conf.all.accept_source_route = 0
+      net.ipv4.conf.default.accept_source_route = 0
+      net.ipv6.conf.all.accept_source_route = 0
+      net.ipv6.conf.default.accept_source_route = 0
+
+      # --- CIS 3.2.2 — Disable ICMP redirect acceptance ---
+      # ICMP redirects can be used for MITM attacks by telling your server
+      # to route traffic through an attacker-controlled gateway.
+      net.ipv4.conf.all.accept_redirects = 0
+      net.ipv4.conf.default.accept_redirects = 0
+      net.ipv6.conf.all.accept_redirects = 0
+      net.ipv6.conf.default.accept_redirects = 0
+
+      # --- CIS 3.2.3 — Disable secure ICMP redirect acceptance ---
+      # Even "secure" redirects from known gateways should be ignored.
+      net.ipv4.conf.all.secure_redirects = 0
+      net.ipv4.conf.default.secure_redirects = 0
+
+      # --- CIS 3.2.4 — Log suspicious (martian) packets ---
+      # Martian packets have impossible source addresses. Logging them
+      # helps detect spoofing attempts and misconfigured networks.
+      net.ipv4.conf.all.log_martians = 1
+      net.ipv4.conf.default.log_martians = 1
+
+      # --- CIS 3.2.5 — Ignore broadcast ICMP requests ---
+      # Prevents the server from participating in Smurf amplification attacks.
+      net.ipv4.icmp_echo_ignore_broadcasts = 1
+
+      # --- CIS 3.2.6 — Ignore bogus ICMP error responses ---
+      net.ipv4.icmp_ignore_bogus_error_responses = 1
+
+      # --- CIS 3.2.7 — Enable Reverse Path Filtering ---
+      # Drops packets where the source address doesn't match the interface
+      # they arrived on. Strong anti-spoofing measure.
+      net.ipv4.conf.all.rp_filter = 1
+      net.ipv4.conf.default.rp_filter = 1
+
+      # --- CIS 3.2.8 — Enable TCP SYN Cookies ---
+      # Protects against SYN flood DoS attacks by using cryptographic
+      # cookies instead of allocating resources for half-open connections.
+      net.ipv4.tcp_syncookies = 1
+
+      # --- CIS 3.2.9 — Disable IPv6 router advertisements ---
+      # Servers should not accept router advertisements (SLAAC).
+      # Your network uses static IPs via DHCP/cloud-init anyway.
+      net.ipv6.conf.all.accept_ra = 0
+      net.ipv6.conf.default.accept_ra = 0
+
+      # --- Additional hardening ---
+      # ASLR (Address Space Layout Randomization) — randomises memory
+      # layout to make exploitation harder. Level 2 = full randomisation.
+      kernel.randomize_va_space = 2
+
+      # Restrict access to kernel logs (prevents info leaks)
+      kernel.dmesg_restrict = 1
+
+      # Restrict kernel pointer exposure in /proc
+      kernel.kptr_restrict = 2
+
+      # Disable sending ICMP redirects (we're not a router)
+      net.ipv4.conf.all.send_redirects = 0
+      net.ipv4.conf.default.send_redirects = 0
+
+
+  # -------------------------------------------------------------------------
+  # CIS 5.2 — SSH Server Hardening
+  # -------------------------------------------------------------------------
+  # NOTE: PasswordAuthentication is left YES per your request.
+  # Ansible will disable it later after deploying key-only auth.
+  #
+  # All other settings follow CIS Level 1 recommendations.
+  # -------------------------------------------------------------------------
+  - path: /etc/ssh/sshd_config.d/50-cis-hardening.conf
+    owner: root:root
+    permissions: "0600"
+    content: |
+      # ---- CIS 5.2 SSH Server Hardening ----
+
+      # CIS 5.2.4 — Limit authentication attempts per connection
+      MaxAuthTries 4
+
+      # CIS 5.2.5 — Require idle timeout (seconds inactive before disconnect)
+      ClientAliveInterval 300
+      ClientAliveCountMax 3
+
+      # CIS 5.2.6 — Disable .rhosts authentication (legacy, insecure)
+      IgnoreRhosts yes
+
+      # CIS 5.2.7 — Disable host-based authentication
+      HostbasedAuthentication no
+
+      # CIS 5.2.8 — Disable root login via SSH
+      PermitRootLogin no
+
+      # CIS 5.2.9 — Disable empty passwords
+      PermitEmptyPasswords no
+
+      # CIS 5.2.10 — Disable X11 forwarding (unnecessary on servers)
+      X11Forwarding no
+
+      # CIS 5.2.11 — Set login grace time (seconds to complete auth)
+      LoginGraceTime 60
+
+      # CIS 5.2.13 — Restrict SSH to strong ciphers
+      Ciphers aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+
+      # CIS 5.2.14 — Restrict SSH to strong MACs
+      MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
+
+      # CIS 5.2.15 — Restrict SSH to strong key exchange algorithms
+      KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,diffie-hellman-group-exchange-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
+
+      # CIS 5.2.20 — Limit concurrent unauthenticated connections
+      MaxStartups 10:30:60
+
+      # CIS 5.2.21 — Set SSH banner
+      Banner /etc/issue.net
+
+      # ---- DELIBERATELY KEPT ENABLED (will be hardened by Ansible) ----
+      # PasswordAuthentication yes  (sshd default is yes, so no line needed)
+
+
+  # -------------------------------------------------------------------------
+  # Login warning banner (CIS 1.7)
+  # -------------------------------------------------------------------------
+  - path: /etc/issue.net
+    owner: root:root
+    permissions: "0644"
+    content: |
+      ******************************************************************
+      *  This system is privately owned. Unauthorised access is        *
+      *  prohibited. All connections may be monitored and recorded.    *
+      ******************************************************************
+
+  - path: /etc/issue
+    owner: root:root
+    permissions: "0644"
+    content: |
+      ******************************************************************
+      *  This system is privately owned. Unauthorised access is        *
+      *  prohibited. All connections may be monitored and recorded.    *
+      ******************************************************************
+
+
+  # -------------------------------------------------------------------------
+  # CIS 4.1.1.x — Audit daemon configuration
+  # -------------------------------------------------------------------------
+  # Basic audit rules to log security-relevant events. Ansible can
+  # deploy a more comprehensive ruleset later.
+  # -------------------------------------------------------------------------
+  - path: /etc/audit/rules.d/cis-baseline.rules
+    owner: root:root
+    permissions: "0640"
+    content: |
+      # CIS 4.1.4 — Log changes to user/group identity files
+      -w /etc/group -p wa -k identity
+      -w /etc/passwd -p wa -k identity
+      -w /etc/gshadow -p wa -k identity
+      -w /etc/shadow -p wa -k identity
+      -w /etc/security/opasswd -p wa -k identity
+
+      # CIS 4.1.6 — Log changes to network configuration
+      -w /etc/sysconfig/network -p wa -k system-network
+      -w /etc/hosts -p wa -k system-network
+
+      # CIS 4.1.7 — Log changes to system administration scope (sudoers)
+      -w /etc/sudoers -p wa -k scope
+      -w /etc/sudoers.d/ -p wa -k scope
+
+      # CIS 4.1.8 — Log login and logout events
+      -w /var/log/lastlog -p wa -k logins
+      -w /var/run/faillock -p wa -k logins
+
+      # CIS 4.1.15 — Log changes to date and time
+      -a always,exit -F arch=b64 -S adjtimex -S settimeofday -k time-change
+      -a always,exit -F arch=b64 -S clock_settime -k time-change
+      -w /etc/localtime -p wa -k time-change
+
+      # CIS 4.1.17 — Make audit config immutable (requires reboot to change)
+      # Uncomment this AFTER you're happy with your rules:
+      # -e 2
+
+
+  # -------------------------------------------------------------------------
+  # Default umask hardening (CIS 5.4.4)
+  # -------------------------------------------------------------------------
+  - path: /etc/profile.d/cis-umask.sh
+    owner: root:root
+    permissions: "0644"
+    content: |
+      # CIS 5.4.4 — Set default umask to 027
+      # This means new files are readable only by owner and group,
+      # not by "others". More restrictive than the default 022.
+      umask 027
+
+
+# ---------------------------------------------------------------------------
+# Run Commands (executed in order on first boot)
+# ---------------------------------------------------------------------------
+runcmd:
+  # ---- Apply sysctl settings immediately ----
+  - sysctl --system
+
+  # ---- Set hostname explicitly ----
+  # Fedora 43 with systemd-hostnamed doesn't always pick up cloud-init's
+  # hostname directive. hostnamectl ensures it sticks.
+  - hostnamectl set-hostname ${hostname}
+
+  # ---- Enable and start essential services ----
+  # qemu-guest-agent: Proxmox integration
+  - systemctl enable --now qemu-guest-agent
+
+  # firewalld: host-based firewall (CIS 3.5)
+  # Default zone is "public" which denies all inbound except SSH.
+  - systemctl enable --now firewalld
+
+  # auditd: system auditing (CIS 4.1)
+  - systemctl enable --now auditd
+
+  # chronyd: NTP time sync (CIS 2.2.1)
+  - systemctl enable --now chronyd
+
+  # ---- CIS 1.3.1 — Initialise AIDE (file integrity monitoring) ----
+  # AIDE creates a database of file checksums. Later, you can run
+  # `aide --check` to detect unauthorized file changes.
+  # This takes a minute or two on first run.
+  - aide --init
+  - mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
+
+  # ---- CIS 6.1 — Fix critical file permissions ----
+  - chmod 644 /etc/passwd
+  - chmod 644 /etc/group
+  - chmod 000 /etc/shadow
+  - chmod 000 /etc/gshadow
+  - chown root:root /etc/passwd /etc/group /etc/shadow /etc/gshadow
+
+  # ---- Clean up: remove the default fedora user if it exists ----
+  - userdel -r fedora 2>/dev/null || true
+
+  # ---- SELinux: ensure enforcing mode (CIS 1.6) ----
+  # Fedora Cloud images ship with SELinux enabled. Verify it's enforcing.
+  - sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config
+  - setenforce 1 || true
+
+
+# ---------------------------------------------------------------------------
+# Final reboot
+# ---------------------------------------------------------------------------
+# Reboot after cloud-init completes to ensure all kernel parameters,
+# module blacklists, and service configurations take full effect.
+# ---------------------------------------------------------------------------
+power_state:
+  mode: reboot
+  message: "Cloud-init hardening complete — rebooting"
+  timeout: 30
+  condition: true

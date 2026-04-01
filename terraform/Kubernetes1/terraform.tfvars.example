@@ -1,0 +1,57 @@
+# ============================================================================
+# terraform.tfvars.example — Example Variable Values
+# ============================================================================
+#
+# HOW TO USE:
+#   1. Copy this file:  cp terraform.tfvars.example terraform.tfvars
+#   2. Fill in your actual values
+#   3. NEVER commit terraform.tfvars to Git (it contains secrets!)
+#      Add it to .gitignore:  echo "terraform.tfvars" >> .gitignore
+#
+# Terraform automatically loads terraform.tfvars when you run plan/apply.
+# You can also use multiple .tfvars files:
+#   terraform apply -var-file="production.tfvars"
+# ============================================================================
+
+
+# --- Proxmox Connection ---------------------------------------------------
+
+proxmox_api_url    = "https://192.168.86.22:8006" # proxmox3
+proxmox_api_token  = "terraform@pam!terraform=YOUR-SECRET-TOKEN-UUID-HERE"
+proxmox_tls_insecure = true # Set false if you install real TLS certs
+
+
+# --- VM Identity ----------------------------------------------------------
+
+vm_name        = "test-vm"
+vm_id          = 0          # 0 = auto-assign
+vm_description = "Test VM provisioned by Terraform"
+target_node    = "proxmox3" # Where your template (9000) lives
+template_id    = 9000       # Fedora Cloud template ID
+
+
+# --- VM Resources ---------------------------------------------------------
+
+cpu_cores   = 2
+cpu_type    = "x86-64-v2-AES"
+memory_mb   = 2048
+disk_size_gb = 32
+storage_pool = "local-lvm"
+snippet_storage = "SanxerNas" # NAS-backed storage for cloud-init snippets
+
+
+# --- Network --------------------------------------------------------------
+
+network_bridge = "vmbr0"
+vlan_id        = 86                 # 86 = TrustedServerLAN, 87 = IoTandGuest, -1 = no tag
+ip_address     = "192.168.86.100/24"
+gateway        = "192.168.86.1"     # pfSense gateway for VLAN 86
+dns_servers    = ["192.168.86.10"]  # Pi-hole on HomeLab3
+
+
+# --- Cloud-Init / User ---------------------------------------------------
+
+ci_user           = "rasmus"
+ci_ssh_public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... rasmus@workstation"
+timezone          = "Europe/Copenhagen"
+vm_tags           = ["terraform", "fedora"]

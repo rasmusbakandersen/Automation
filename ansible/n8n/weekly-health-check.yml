@@ -1,0 +1,611 @@
+---
+# weekly-health-check.yml
+# Weekly health report: Prometheus metrics, disk/SMART health, Docker bloat
+# Outputs tagged JSON lines for n8n parsing.
+#
+# Usage:
+#   ansible-playbook -i /home/rasmus/automation/ansible/inventory.ini \
+#     /home/rasmus/automation/ansible/n8n/weekly-health-check.yml
+
+# ═══════════════════════════════════════════════════════════════════════
+# PLAY 1: Prometheus metrics (CPU, RAM, network over past 7 days)
+# Runs once from homelab1, queries prometheus.sanxer.dk
+# ═══════════════════════════════════════════════════════════════════════
+- name: Collect Prometheus metrics (7-day summary)
+  hosts: homelab1
+  gather_facts: false
+  become: true
+  run_once: true
+
+  vars:
+    prometheus_url: "http://192.168.86.12:31090"
+
+  tasks:
+    - name: Query Prometheus for weekly resource summary
+      ansible.builtin.shell: |
+        python3 << 'PYEOF'
+        import json
+        import urllib.request
+        import urllib.parse
+        import ssl
+
+        PROM = "{{ prometheus_url }}"
+
+        def prom_query(query):
+            """Execute instant query against Prometheus"""
+            url = f"{PROM}/api/v1/query?query={urllib.parse.quote(query)}"
+            try:
+                req = urllib.request.Request(url, headers={"Accept": "application/json"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read())
+                    if data.get("status") == "success":
+                        return data["data"]["result"]
+            except Exception as e:
+                return [{"error": str(e)}]
+            return []
+
+        results = {}
+
+        # ── CPU: current and 7-day average per instance ──
+        results["cpu_current"] = []
+        raw = prom_query('100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])))')
+        for r in raw:
+            if "error" not in r:
+                results["cpu_current"].append({
+                    "instance": r["metric"].get("instance", "unknown"),
+                    "cpu_pct": round(float(r["value"][1]), 1)
+                })
+
+        results["cpu_7d_avg"] = []
+        raw = prom_query('avg_over_time((100 - (avg by(instance)(rate(node_cpu_seconds_total{mode="idle"}[5m]))))[7d:1h])')
+        for r in raw:
+            if "error" not in r:
+                results["cpu_7d_avg"].append({
+                    "instance": r["metric"].get("instance", "unknown"),
+                    "cpu_avg_pct": round(float(r["value"][1]), 1)
+                })
+
+        # ── RAM: current usage per instance ──
+        results["ram_current"] = []
+        raw = prom_query('(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100')
+        for r in raw:
+            if "error" not in r:
+                results["ram_current"].append({
+                    "instance": r["metric"].get("instance", "unknown"),
+                    "ram_pct": round(float(r["value"][1]), 1)
+                })
+
+        # ── RAM: 7-day average ──
+        results["ram_7d_avg"] = []
+        raw = prom_query('avg_over_time(((1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100)[7d:1h])')
+        for r in raw:
+            if "error" not in r:
+                results["ram_7d_avg"].append({
+                    "instance": r["metric"].get("instance", "unknown"),
+                    "ram_avg_pct": round(float(r["value"][1]), 1)
+                })
+
+        # ── Network: total bytes received/sent over 7 days per instance ──
+        results["network_7d"] = []
+        raw = prom_query('increase(node_network_receive_bytes_total{device=~"eth.*|ens.*|enp.*"}[7d])')
+        rx_by_instance = {}
+        for r in raw:
+            if "error" not in r:
+                inst = r["metric"].get("instance", "unknown")
+                rx_by_instance[inst] = rx_by_instance.get(inst, 0) + float(r["value"][1])
+
+        raw = prom_query('increase(node_network_transmit_bytes_total{device=~"eth.*|ens.*|enp.*"}[7d])')
+        tx_by_instance = {}
+        for r in raw:
+            if "error" not in r:
+                inst = r["metric"].get("instance", "unknown")
+                tx_by_instance[inst] = tx_by_instance.get(inst, 0) + float(r["value"][1])
+
+        all_instances = set(list(rx_by_instance.keys()) + list(tx_by_instance.keys()))
+        for inst in sorted(all_instances):
+            rx_gb = round(rx_by_instance.get(inst, 0) / (1024**3), 2)
+            tx_gb = round(tx_by_instance.get(inst, 0) / (1024**3), 2)
+            results["network_7d"].append({
+                "instance": inst,
+                "rx_gb": rx_gb,
+                "tx_gb": tx_gb
+            })
+
+        # ── Container CPU (if cAdvisor/container metrics available) ──
+        results["container_cpu"] = []
+        raw = prom_query('sort_desc(sum by(name)(rate(container_cpu_usage_seconds_total{name!=""}[5m])) * 100)')
+        for r in raw[:15]:  # top 15 containers
+            if "error" not in r:
+                results["container_cpu"].append({
+                    "name": r["metric"].get("name", "unknown"),
+                    "cpu_pct": round(float(r["value"][1]), 2)
+                })
+
+        # ── Container RAM ──
+        results["container_ram"] = []
+        raw = prom_query('sort_desc(container_memory_usage_bytes{name!=""} / (1024*1024))')
+        for r in raw[:15]:  # top 15
+            if "error" not in r:
+                results["container_ram"].append({
+                    "name": r["metric"].get("name", "unknown"),
+                    "ram_mb": round(float(r["value"][1]), 1)
+                })
+
+        print("PROMJSON" + json.dumps(results, separators=(',', ':')))
+        PYEOF
+      register: prom_output
+      changed_when: false
+      failed_when: false
+
+    - name: Output Prometheus summary
+      ansible.builtin.debug:
+        msg: "{{ prom_output.stdout_lines | select('match', '^PROMJSON') | first | default('PROMJSON{}') }}"
+
+# ═══════════════════════════════════════════════════════════════════════
+# PLAY 2: Disk space on all hosts (df -h)
+# ═══════════════════════════════════════════════════════════════════════
+- name: Collect disk space across all hosts
+  hosts: all
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Get disk usage
+      ansible.builtin.shell: |
+        python3 << 'PYEOF'
+        import json
+        import subprocess
+
+        result = subprocess.run(
+            ["df", "-h", "--output=target,size,used,avail,pcent,fstype"],
+            capture_output=True, text=True
+        )
+
+        filesystems = []
+        for line in result.stdout.strip().split("\n")[1:]:
+            parts = line.split()
+            if len(parts) >= 6:
+                mount, size, used, avail, pct, fstype = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
+                # Skip tiny/virtual filesystems
+                if fstype in ("tmpfs", "devtmpfs", "squashfs", "overlay", "efivarfs"):
+                    continue
+                if mount.startswith(("/dev", "/sys", "/run", "/snap")):
+                    continue
+                pct_num = int(pct.replace("%", "")) if pct.replace("%", "").isdigit() else 0
+                filesystems.append({
+                    "mount": mount,
+                    "size": size,
+                    "used": used,
+                    "avail": avail,
+                    "use_pct": pct_num,
+                    "fstype": fstype
+                })
+
+        output = {
+            "host": "{{ inventory_hostname }}",
+            "filesystems": filesystems,
+            "critical": [f for f in filesystems if f["use_pct"] >= 85]
+        }
+        print("DISKJSON" + json.dumps(output, separators=(',', ':')))
+        PYEOF
+      register: disk_output
+      changed_when: false
+      failed_when: false
+
+    - name: Output disk summary
+      ansible.builtin.debug:
+        msg: "{{ disk_output.stdout_lines | select('match', '^DISKJSON') | first | default('DISKJSON{}') }}"
+
+# ═══════════════════════════════════════════════════════════════════════
+# PLAY 3: SMART health on Proxmox hosts (physical drives)
+# ═══════════════════════════════════════════════════════════════════════
+- name: Collect SMART health data (Proxmox physical hosts)
+  hosts: proxmox_hosts
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Check if smartctl is available
+      ansible.builtin.shell: which smartctl 2>/dev/null || echo "not_found"
+      register: smartctl_check
+      changed_when: false
+      failed_when: false
+
+    - name: Get SMART data for all drives
+      ansible.builtin.shell: |
+        python3 << 'PYEOF'
+        import json
+        import subprocess
+        import re
+
+        # Find block devices (skip partitions, loop, dm)
+        lsblk = subprocess.run(
+            ["lsblk", "-d", "-n", "-o", "NAME,SIZE,TYPE,ROTA"],
+            capture_output=True, text=True
+        )
+
+        drives = []
+        for line in lsblk.stdout.strip().split("\n"):
+            parts = line.split()
+            if len(parts) >= 3 and parts[2] == "disk":
+                dev = f"/dev/{parts[0]}"
+                size = parts[1]
+                rotational = parts[3] if len(parts) > 3 else "?"
+
+                drive_info = {
+                    "device": dev,
+                    "size": size,
+                    "type": "HDD" if rotational == "1" else "SSD/NVMe",
+                    "health": "unknown",
+                    "temperature": "unknown",
+                    "power_on_hours": "unknown",
+                    "reallocated_sectors": "unknown",
+                    "warnings": []
+                }
+
+                # Get SMART health
+                try:
+                    smart = subprocess.run(
+                        ["smartctl", "-a", "-j", dev],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    sdata = json.loads(smart.stdout)
+
+                    # Overall health
+                    health = sdata.get("smart_status", {})
+                    drive_info["health"] = "PASSED" if health.get("passed", False) else "FAILED"
+
+                    # Temperature
+                    temp = sdata.get("temperature", {})
+                    if temp.get("current"):
+                        drive_info["temperature"] = f"{temp['current']}°C"
+                        if temp["current"] > 50:
+                            drive_info["warnings"].append(f"High temp: {temp['current']}°C")
+
+                    # Power on hours
+                    poh = sdata.get("power_on_time", {})
+                    if poh.get("hours"):
+                        drive_info["power_on_hours"] = poh["hours"]
+                        if poh["hours"] > 40000:
+                            drive_info["warnings"].append(f"High usage: {poh['hours']} hours")
+
+                    # Check SMART attributes for concerning values
+                    for attr in sdata.get("ata_smart_attributes", {}).get("table", []):
+                        name = attr.get("name", "")
+                        raw_val = attr.get("raw", {}).get("value", 0)
+
+                        if name == "Reallocated_Sector_Ct":
+                            drive_info["reallocated_sectors"] = raw_val
+                            if raw_val > 0:
+                                drive_info["warnings"].append(f"Reallocated sectors: {raw_val}")
+
+                        if name == "Current_Pending_Sector" and raw_val > 0:
+                            drive_info["warnings"].append(f"Pending sectors: {raw_val}")
+
+                        if name == "Offline_Uncorrectable" and raw_val > 0:
+                            drive_info["warnings"].append(f"Uncorrectable sectors: {raw_val}")
+
+                    # NVMe specific
+                    nvme_health = sdata.get("nvme_smart_health_information_log", {})
+                    if nvme_health:
+                        pct_used = nvme_health.get("percentage_used", 0)
+                        drive_info["nvme_pct_used"] = pct_used
+                        if pct_used > 80:
+                            drive_info["warnings"].append(f"NVMe wear: {pct_used}% used")
+                        media_errors = nvme_health.get("media_errors", 0)
+                        if media_errors > 0:
+                            drive_info["warnings"].append(f"NVMe media errors: {media_errors}")
+
+                except Exception as e:
+                    drive_info["health"] = f"error: {str(e)[:50]}"
+
+                drives.append(drive_info)
+
+        output = {
+            "host": "{{ inventory_hostname }}",
+            "drives": drives,
+            "has_warnings": any(d["warnings"] for d in drives),
+            "has_failures": any(d["health"] == "FAILED" for d in drives)
+        }
+        print("SMARTJSON" + json.dumps(output, separators=(',', ':')))
+        PYEOF
+      register: smart_output
+      changed_when: false
+      failed_when: false
+      when: smartctl_check.stdout | trim != "not_found"
+
+    - name: Output SMART summary
+      ansible.builtin.debug:
+        msg: "{{ smart_output.stdout_lines | select('match', '^SMARTJSON') | first | default('SMARTJSON{}') }}"
+      when: smart_output is defined and smart_output.stdout is defined
+
+# ═══════════════════════════════════════════════════════════════════════
+# PLAY 4: Docker image/volume bloat on docker-hosts
+# Uses --format json to avoid Go template {{ }} conflicting with Jinja2
+# ═══════════════════════════════════════════════════════════════════════
+- name: Check Docker bloat (unused images, dangling volumes)
+  hosts: docker-hosts
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Analyze Docker bloat
+      ansible.builtin.shell: |
+        HOSTNAME="{{ inventory_hostname }}" python3 << 'PYEOF'
+        import json
+        import subprocess
+        import os
+
+        host = os.environ.get("HOSTNAME", "unknown")
+
+        def run(cmd):
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+            return r.stdout.strip()
+
+        # ── All images (JSON output, one object per line) ──
+        all_images_raw = run("docker images --format json")
+        all_images = []
+        for line in all_images_raw.split("\n"):
+            if line.strip():
+                try:
+                    all_images.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+
+        # ── Running container images ──
+        running_raw = run("docker ps --format json")
+        running_images = set()
+        for line in running_raw.split("\n"):
+            if line.strip():
+                try:
+                    c = json.loads(line)
+                    running_images.add(c.get("Image", ""))
+                except json.JSONDecodeError:
+                    pass
+
+        # ── Categorize images ──
+        dangling_images = [i for i in all_images if i.get("Repository") == "<none>"]
+        unused_images = []
+        for i in all_images:
+            tag = f"{i.get('Repository', '')}:{i.get('Tag', '')}"
+            if tag not in running_images and i.get("Repository") != "<none>":
+                unused_images.append({"image": tag, "size": i.get("Size", "?")})
+
+        # ── Dangling volumes (JSON output) ──
+        dangling_vols_raw = run("docker volume ls --filter 'dangling=true' --format json")
+        dangling_volumes = []
+        for line in dangling_vols_raw.split("\n"):
+            if line.strip():
+                try:
+                    v = json.loads(line)
+                    dangling_volumes.append(v.get("Name", "unknown"))
+                except json.JSONDecodeError:
+                    pass
+
+        # ── Docker system df (JSON output) ──
+        system_df_raw = run("docker system df --format json")
+        df_summary = []
+        for line in system_df_raw.split("\n"):
+            if line.strip():
+                try:
+                    d = json.loads(line)
+                    df_summary.append({
+                        "type": d.get("Type", "?"),
+                        "count": d.get("TotalCount", "?"),
+                        "size": d.get("Size", "?"),
+                        "reclaimable": d.get("Reclaimable", "?")
+                    })
+                except json.JSONDecodeError:
+                    pass
+
+        output = {
+            "host": host,
+            "dangling_images": len(dangling_images),
+            "unused_images": unused_images[:15],
+            "unused_images_count": len(unused_images),
+            "dangling_volumes": len(dangling_volumes),
+            "dangling_volume_names": dangling_volumes[:10],
+            "system_df": df_summary,
+            "has_bloat": len(dangling_images) > 0 or len(unused_images) > 0 or len(dangling_volumes) > 0
+        }
+        print("DOCKERJSON" + json.dumps(output, separators=(',', ':')))
+        PYEOF
+      register: docker_output
+      changed_when: false
+      failed_when: false
+
+    - name: Output Docker bloat summary
+      ansible.builtin.debug:
+        msg: "{{ docker_output.stdout_lines | select('match', '^DOCKERJSON') | first | default('DOCKERJSON{}') }}"
+
+# ═══════════════════════════════════════════════════════════════════════
+# PLAY 5: K3s cluster health (nodes, pods, Longhorn, deployments)
+# Runs once from homelab5 (control-plane node)
+# ═══════════════════════════════════════════════════════════════════════
+- name: Collect K3s cluster health
+  hosts: homelab5
+  gather_facts: false
+  become: true
+  run_once: true
+
+  tasks:
+    - name: Gather K3s cluster health data
+      ansible.builtin.shell: |
+        KUBECONFIG=/etc/rancher/k3s/k3s.yaml python3 << 'PYEOF'
+        import json
+        import subprocess
+        import os
+
+        os.environ["KUBECONFIG"] = "/etc/rancher/k3s/k3s.yaml"
+
+        def kubectl_json(cmd):
+            """Run kubectl command and return parsed JSON"""
+            try:
+                r = subprocess.run(
+                    f"kubectl {cmd} -o json",
+                    shell=True, capture_output=True, text=True, timeout=30
+                )
+                return json.loads(r.stdout) if r.returncode == 0 else None
+            except Exception:
+                return None
+
+        def kubectl_text(cmd):
+            """Run kubectl command and return raw text"""
+            try:
+                r = subprocess.run(
+                    f"kubectl {cmd}",
+                    shell=True, capture_output=True, text=True, timeout=30
+                )
+                return r.stdout.strip() if r.returncode == 0 else ""
+            except Exception:
+                return ""
+
+        results = {}
+
+        # ── Node status ──
+        nodes_data = kubectl_json("get nodes")
+        nodes = []
+        if nodes_data:
+            for node in nodes_data.get("items", []):
+                name = node["metadata"]["name"]
+                conditions = {c["type"]: c["status"] for c in node.get("status", {}).get("conditions", [])}
+                ready = conditions.get("Ready", "Unknown")
+                roles = [k.replace("node-role.kubernetes.io/", "") for k in node["metadata"].get("labels", {}) if k.startswith("node-role.kubernetes.io/")]
+                
+                # Resource capacity
+                capacity = node.get("status", {}).get("capacity", {})
+                allocatable = node.get("status", {}).get("allocatable", {})
+                
+                nodes.append({
+                    "name": name,
+                    "ready": ready == "True",
+                    "roles": roles or ["worker"],
+                    "cpu_capacity": capacity.get("cpu", "?"),
+                    "memory_capacity": capacity.get("memory", "?"),
+                    "disk_pressure": conditions.get("DiskPressure", "False") == "True",
+                    "memory_pressure": conditions.get("MemoryPressure", "False") == "True",
+                    "pid_pressure": conditions.get("PIDPressure", "False") == "True",
+                })
+        results["nodes"] = nodes
+        results["nodes_ready"] = sum(1 for n in nodes if n["ready"])
+        results["nodes_total"] = len(nodes)
+
+        # ── Pods: not running, high restarts, CrashLoopBackOff ──
+        pods_data = kubectl_json("get pods --all-namespaces")
+        problem_pods = []
+        high_restart_pods = []
+        total_pods = 0
+        running_pods = 0
+
+        if pods_data:
+            for pod in pods_data.get("items", []):
+                total_pods += 1
+                ns = pod["metadata"]["namespace"]
+                name = pod["metadata"]["name"]
+                phase = pod.get("status", {}).get("phase", "Unknown")
+
+                if phase == "Running":
+                    running_pods += 1
+
+                # Check container statuses for restarts and CrashLoop
+                for cs in pod.get("status", {}).get("containerStatuses", []):
+                    restarts = cs.get("restartCount", 0)
+                    waiting = cs.get("state", {}).get("waiting", {})
+                    reason = waiting.get("reason", "")
+
+                    if restarts > 5:
+                        high_restart_pods.append({
+                            "namespace": ns,
+                            "pod": name,
+                            "container": cs["name"],
+                            "restarts": restarts,
+                            "reason": reason if reason else phase
+                        })
+
+                    if reason in ("CrashLoopBackOff", "Error", "ImagePullBackOff", "ErrImagePull"):
+                        problem_pods.append({
+                            "namespace": ns,
+                            "pod": name,
+                            "container": cs["name"],
+                            "reason": reason
+                        })
+
+                # Pods stuck in Pending/Failed
+                if phase in ("Pending", "Failed"):
+                    problem_pods.append({
+                        "namespace": ns,
+                        "pod": name,
+                        "container": "-",
+                        "reason": phase
+                    })
+
+        results["total_pods"] = total_pods
+        results["running_pods"] = running_pods
+        results["problem_pods"] = problem_pods[:15]
+        results["high_restart_pods"] = high_restart_pods[:10]
+
+        # ── Deployments not fully available ──
+        deps_data = kubectl_json("get deployments --all-namespaces")
+        unhealthy_deps = []
+        if deps_data:
+            for dep in deps_data.get("items", []):
+                ns = dep["metadata"]["namespace"]
+                name = dep["metadata"]["name"]
+                spec_replicas = dep.get("spec", {}).get("replicas", 0)
+                status = dep.get("status", {})
+                available = status.get("availableReplicas", 0) or 0
+                ready = status.get("readyReplicas", 0) or 0
+
+                if available < spec_replicas:
+                    unhealthy_deps.append({
+                        "namespace": ns,
+                        "deployment": name,
+                        "desired": spec_replicas,
+                        "available": available,
+                        "ready": ready
+                    })
+        results["unhealthy_deployments"] = unhealthy_deps
+
+        # ── Longhorn volume health ──
+        lh_volumes = kubectl_json("get volumes.longhorn.io -n longhorn-system")
+        lh_summary = {"healthy": 0, "degraded": 0, "faulted": 0, "unknown": 0, "details": []}
+        if lh_volumes:
+            for vol in lh_volumes.get("items", []):
+                name = vol["metadata"]["name"]
+                robustness = vol.get("status", {}).get("robustness", "unknown")
+                state = vol.get("status", {}).get("state", "unknown")
+                size = vol.get("spec", {}).get("size", "?")
+                replicas = vol.get("spec", {}).get("numberOfReplicas", "?")
+
+                if robustness == "healthy":
+                    lh_summary["healthy"] += 1
+                elif robustness == "degraded":
+                    lh_summary["degraded"] += 1
+                    lh_summary["details"].append({
+                        "name": name, "robustness": robustness,
+                        "state": state, "replicas": replicas
+                    })
+                elif robustness == "faulted":
+                    lh_summary["faulted"] += 1
+                    lh_summary["details"].append({
+                        "name": name, "robustness": robustness,
+                        "state": state, "replicas": replicas
+                    })
+                else:
+                    lh_summary["unknown"] += 1
+
+        results["longhorn"] = lh_summary
+
+        # ── Recent events (warnings only, last 50) ──
+        events_raw = kubectl_text("get events --all-namespaces --field-selector type=Warning --sort-by=.lastTimestamp 2>/dev/null | tail -20")
+        results["recent_warnings"] = len(events_raw.split("\n")) if events_raw else 0
+
+        print("K3SJSON" + json.dumps(results, separators=(',', ':')))
+        PYEOF
+      register: k3s_output
+      changed_when: false
+      failed_when: false
+
+    - name: Output K3s health summary
+      ansible.builtin.debug:
+        msg: "{{ k3s_output.stdout_lines | select('match', '^K3SJSON') | first | default('K3SJSON{}') }}"

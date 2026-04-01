@@ -1,0 +1,21 @@
+---
+# k8s-scan-24-hour.yml
+# Wrapper playbook - calls k8s-scan-24-hour.sh on localhost
+# Place both files in ~/automation/ansible/n8n/
+
+- name: Scan K3s pods for errors (last 24h)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Run K8s error scan script
+      ansible.builtin.script:
+        cmd: "{{ playbook_dir }}/k8s-scan-24-hour.sh"
+      register: k8s_log_output
+      changed_when: false
+
+    - name: Output results
+      ansible.builtin.debug:
+        msg: "{{ k8s_log_output.stdout }}"
